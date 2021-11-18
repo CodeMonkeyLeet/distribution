@@ -11,6 +11,7 @@ import (
 	dcontext "github.com/distribution/distribution/v3/context"
 	"github.com/distribution/distribution/v3/manifest/manifestlist"
 	"github.com/distribution/distribution/v3/manifest/ocischema"
+	"github.com/distribution/distribution/v3/manifest/patching"
 	"github.com/distribution/distribution/v3/manifest/schema1"
 	"github.com/distribution/distribution/v3/manifest/schema2"
 	"github.com/distribution/distribution/v3/reference"
@@ -40,7 +41,8 @@ const (
 	manifestlistSchema                     // 2
 	ociSchema                              // 3
 	ociImageIndexSchema                    // 4
-	numStorageTypes                        // 5
+	patchedTags                            // 5
+	numStorageTypes                        // 6
 )
 
 // manifestDispatcher takes the request context and builds the
@@ -115,21 +117,63 @@ func (imh *manifestHandler) GetManifest(w http.ResponseWriter, r *http.Request) 
 			if mediaType == v1.MediaTypeImageIndex {
 				supports[ociImageIndexSchema] = true
 			}
+			if mediaType == patching.MediaTypePatchManifest {
+				supports[patchedTags] = true
+				dcontext.GetLogger(imh).Infof("PATCHING: Accept Header %s", mediaType)
+			}
+		}
+	}
+
+	// Return tags that have an available patch
+	for _, contentpatchHeader := range r.Header[patching.HeaderPatchManifest] {
+		dcontext.GetLogger(imh).Debugf("PATCHING: %s", contentpatchHeader)
+		for _, mediaType := range strings.Split(contentpatchHeader, ",") {
+			if mediaType, _, err = mime.ParseMediaType(mediaType); err != nil {
+				continue
+			}
+			if mediaType == patching.MediaTypePatchManifest {
+				supports[patchedTags] = true
+			}
 		}
 	}
 
 	if imh.Tag != "" {
+		tag := imh.Tag
 		tags := imh.Repository.Tags(imh)
-		desc, err := tags.Get(imh, imh.Tag)
-		if err != nil {
-			if _, ok := err.(distribution.ErrTagUnknown); ok {
-				imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnknown.WithDetail(err))
+
+		// Check for patched tag and if not present serve requested tag
+		if supports[patchedTags] {
+			imh.Tag = tag + "-patch"
+			dcontext.GetLogger(imh).Infof("PATCHING: Request patched tag %s", imh.Tag)
+			desc, err := tags.Get(imh, imh.Tag)
+			if err != nil {
+				if _, ok := err.(distribution.ErrTagUnknown); ok {
+					// Revert to requested tag
+					dcontext.GetLogger(imh).Infof("PATCHING: No patched tag found")
+					imh.Tag = tag
+					supports[patchedTags] = false
+				} else {
+					imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+					return
+				}
 			} else {
-				imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+				imh.Digest = desc.Digest
+				dcontext.GetLogger(imh).Infof("PATCHING: %s with Digest: %s", tag, desc.Digest)
 			}
-			return
 		}
-		imh.Digest = desc.Digest
+
+		if !supports[patchedTags] {
+			desc, err := tags.Get(imh, imh.Tag)
+			if err != nil {
+				if _, ok := err.(distribution.ErrTagUnknown); ok {
+					imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnknown.WithDetail(err))
+				} else {
+					imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+				}
+				return
+			}
+			imh.Digest = desc.Digest
+		}
 	}
 
 	if etagMatch(r, imh.Digest.String()) {
